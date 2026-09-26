@@ -212,11 +212,9 @@ const undoModule = (() => {
         }
       }
       if (!merged) {
-        if (event && (event.eventType !== 'clearauthorship')) {
-          stack.pushEvent(event);
-        }
+        stack.pushEvent(event);
+        undoPtr = 0;
       }
-      undoPtr = 0;
     }
   };
 

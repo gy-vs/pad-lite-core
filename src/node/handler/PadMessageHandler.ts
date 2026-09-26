@@ -23,7 +23,7 @@ import {MapArrayType} from "../types/MapType";
 
 import AttributeMap from '../../static/js/AttributeMap';
 const padManager = require('../db/PadManager');
-import {checkRep, cloneAText, compose, deserializeOps, follow, identity, inverse, makeAText, makeSplice, moveOpsToNewPool, mutateAttributionLines, mutateTextLines, oldLen, prepareForWire, splitAttributionLines, splitTextLines, unpack} from '../../static/js/Changeset';
+import {checkRep, cloneAText, compose, deserializeOps, follow, identity, inverse, makeAText, makeSplice, moveOpsToNewPool, mutateAttributionLines, mutateTextLines, oldLen, prepareForWire, splitAttributionLines, splitTextLines, subattribution, unpack} from '../../static/js/Changeset';
 import ChatMessage from '../../static/js/ChatMessage';
 import AttributePool from '../../static/js/AttributePool';
 const AttributeManager = require('../../static/js/AttributeManager');
@@ -610,6 +610,143 @@ const handleUserInfoUpdate = async (socket:any, {data: {userInfo: {name, colorId
 };
 
 /**
+ * Maps a half-open interval [start, end) of positions in the newer document back one revision,
+ * given the changeset that transformed the older document into the newer one. Surviving characters
+ * are translated to their positions in the older document and reported (possibly as several
+ * intervals) through `onSurviving`. Inserted characters the interval overlaps are reported through
+ * `onInserted`.
+ *
+ * @param start Interval start in the newer document.
+ * @param end Interval end (exclusive) in the newer document.
+ * @param cs Changeset applied to the older document to produce the newer document.
+ * @param onSurviving Called once per translated interval with its start/end in the older document.
+ * @param onInserted Called with the number of inserted characters the interval overlaps.
+ */
+const mapIntervalToPreviousRevision = (
+    start: number, end: number, cs: string,
+    onSurviving: (oldStart: number, oldEnd: number) => void,
+    onInserted: (numChars: number) => void) => {
+  let oldPos = 0; // Position in the older document.
+  let newPos = 0; // Position in the newer document.
+  let survivingStart: number | null = null;
+  let survivingEnd = 0;
+  const flush = () => {
+    if (survivingStart !== null && survivingEnd > survivingStart) {
+      onSurviving(survivingStart, survivingEnd);
+    }
+    survivingStart = null;
+  };
+  for (const op of deserializeOps(unpack(cs).ops)) {
+    if (op.opcode === '+') {
+      const overlap = Math.min(newPos + op.chars, end) - Math.max(newPos, start);
+      if (overlap > 0) {
+        flush();
+        onInserted(overlap);
+      }
+      newPos += op.chars;
+    } else {
+      // '-' consumes only old-document characters (invisible in the newer document); '=' consumes
+      // the same characters in both documents.
+      const opNewEnd = newPos + (op.opcode === '=' ? op.chars : 0);
+      if (op.opcode === '=' && opNewEnd > start && newPos < end) {
+        const oldStart = oldPos + (Math.max(newPos, start) - newPos);
+        const oldEnd = oldPos + (Math.min(opNewEnd, end) - newPos);
+        if (survivingStart === null) survivingStart = oldStart;
+        survivingEnd = oldEnd;
+      } else if (survivingStart !== null) {
+        flush();
+      }
+      oldPos += op.chars;
+      newPos = opNewEnd;
+    }
+  }
+  flush();
+};
+
+/**
+ * Verifies that an "undo clear-authorship" changeset may assign a foreign author id to existing
+ * characters without forging authorship.
+ *
+ * Each requested range must, at every point in the pad history reachable by walking backwards from
+ * `baseRev`, consist solely of characters that were either inserted by that author or already
+ * carried that same author. Characters inserted by anyone else (including freshly typed text that
+ * currently has no author) are rejected.
+ *
+ * @param pad The pad being edited.
+ * @param submitterAuthor The author id of the submitting user.
+ * @param ranges Ranges claiming a foreign author, with positions relative to the document at
+ *     `baseRev`.
+ * @param baseRev Revision number the client based its changeset on.
+ */
+const _validateAuthorRestoreProvenance = async (
+    pad: any, submitterAuthor: string,
+    ranges: {authorId: string, start: number, end: number}[], baseRev: number) => {
+  // Work items carry the position of each character interval in the document currently being
+  // inspected; `rev` is the revision of that document.
+  type Pending = {authorId: string, start: number, end: number, rev: number};
+  let pending: Pending[] = ranges.map((r) => ({...r, rev: baseRev}));
+  // Bound the history walk so a malicious client can't force unbounded database reads. Legitimate
+  // undos resolve at (or a couple of revisions after) the clear-authorship revision.
+  const MAX_HISTORY_WALK = 1000;
+  let walked = 0;
+  while (pending.length > 0) {
+    if (walked++ > MAX_HISTORY_WALK) {
+      throw new Error(`Author ${submitterAuthor} tried to restore authorship whose provenance ` +
+                      `could not be verified within ${MAX_HISTORY_WALK} revisions`);
+    }
+    // Fetch the attributed text at the highest revision still pending and process all items at
+    // that revision together.
+    const rev = pending.reduce((mx, p) => Math.max(mx, p.rev), -1);
+    const atext: AText = await pad.getInternalRevisionAText(rev);
+    const here = pending.filter((p) => p.rev === rev);
+    pending = pending.filter((p) => p.rev !== rev);
+    for (const item of here) {
+      // Inspect the runs of (possibly varying) authorship covering this interval at revision rev.
+      const intervalAttribs = subattribution(atext.attribs, item.start, item.end);
+      let runStart = item.start;
+      for (const rangeOp of deserializeOps(intervalAttribs)) {
+        const runEnd = runStart + rangeOp.chars;
+        const owner = AttributeMap.fromString(rangeOp.attribs, pad.pool).get('author') || '';
+        if (owner === item.authorId) {
+          // Owned by the claimed author at this revision: provenance confirmed for this run.
+          runStart = runEnd;
+          continue;
+        }
+        if (owner !== '') {
+          // Owned by someone else (including the submitter): assigning a different author here
+          // would rewrite history the claimed author never wrote.
+          throw new Error(`Author ${submitterAuthor} tried to restore author ${item.authorId} ` +
+                          `on characters owned by another author at revision ${rev}`);
+        }
+        // Unowned characters at this revision. They must survive from an older revision where this
+        // exact run was owned by the claimed author. Walk the run back one revision.
+        if (rev === 0) {
+          throw new Error(`Author ${submitterAuthor} tried to assign author ${item.authorId} ` +
+                          `to characters with no attributable origin`);
+        }
+        const {changeset: prevCs} = await pad.getRevision(rev);
+        let rejected = false;
+        const older: Pending[] = [];
+        mapIntervalToPreviousRevision(runStart, runEnd, prevCs,
+            (oldStart, oldEnd) => older.push(
+                {authorId: item.authorId, start: oldStart, end: oldEnd, rev: rev - 1}),
+            () => {
+              // The run overlaps text inserted by this revision with no author recorded, so it was
+              // typed anonymously and can never legitimately be attributed to the claimed author.
+              rejected = true;
+            });
+        if (rejected) {
+          throw new Error(`Author ${submitterAuthor} tried to assign author ${item.authorId} ` +
+                          `to newly inserted characters in changeset based on revision ${baseRev}`);
+        }
+        pending.push(...older);
+        runStart = runEnd;
+      }
+    }
+  }
+};
+
+/**
  * Handles a USER_CHANGES message, where the client submits its local
  * edits as a changeset.
  *
@@ -651,21 +788,51 @@ const handleUserChanges = async (socket:any, message: {
     // Verify that the changeset has valid syntax and is in canonical form
     checkRep(changeset);
 
-    // Validate all added 'author' attribs to be the same value as the current user
-    for (const op of deserializeOps(unpack(changeset).ops)) {
-      // + can add text with attribs
-      // = can change or add attribs
-      // - can have attribs, but they are discarded and don't show up in the attribs -
-      // but do show up in the pool
-
+    // Validate all added 'author' attribs to be the same value as the current user.
+    //
+    // + can add text with attribs, = can change or add attribs, and - can have attribs, but they are
+    // discarded and don't show up in the attribs (they do show up in the pool).
+    //
+    // The one exception to "nobody may write under another author's id" is undoing a clear-authorship
+    // action: the client-side undo stack replays an attribute-only changeset that puts back the
+    // original authors, which may include other users' ids. Such a changeset never introduces text, so
+    // it can only touch characters that already exist in the client's base revision. For each foreign
+    // author range, _validateAuthorRestoreProvenance() walks pad history and proves every character
+    // was genuinely authored by that claimed id at some point (following the characters across
+    // intervening clear/restore edits). Newly inserted text, or characters the foreign author never
+    // owned, is rejected, so authorship can never be forged.
+    const csOps = [...deserializeOps(unpack(changeset).ops)];
+    let foreignAuthorRestore: {authorId: string, start: number, end: number}[]|null = null;
+    let oldPos = 0;
+    for (const op of csOps) {
       // Besides verifying the author attribute, this serves a second purpose:
       // AttributeMap.fromString() ensures that all attribute numbers are valid (it will throw if
       // an attribute number isn't in the pool).
       const opAuthorId = AttributeMap.fromString(op.attribs, wireApool).get('author');
-      if (opAuthorId && opAuthorId !== thisSession.author) {
+      if (!opAuthorId || opAuthorId === thisSession.author) {
+        oldPos += op.opcode === '+' ? 0 : op.chars;
+        continue;
+      }
+      if (op.opcode !== '=') {
+        // Foreign authorship may not be attached to inserted or deleted text.
         throw new Error(`Author ${thisSession.author} tried to submit changes as author ` +
                         `${opAuthorId} in changeset ${changeset}`);
       }
+      (foreignAuthorRestore ??= []).push({authorId: opAuthorId, start: oldPos, end: oldPos + op.chars});
+      oldPos += op.chars;
+    }
+    if (foreignAuthorRestore != null) {
+      // A restore may only re-attribute existing characters; it must not modify the text.
+      if (csOps.some((op) => op.opcode === '+' || op.opcode === '-')) {
+        throw new Error(`Author ${thisSession.author} tried to combine text changes with another ` +
+                        `author's attribution in changeset ${changeset}`);
+      }
+      const headRevision = pad.getHeadRevisionNumber();
+      if (!Number.isInteger(baseRev) || baseRev < 0 || baseRev > headRevision) {
+        throw new Error(`Author ${thisSession.author} tried to restore authorship based on an ` +
+                        `invalid revision ${baseRev}`);
+      }
+      await _validateAuthorRestoreProvenance(pad, thisSession.author, foreignAuthorRestore, baseRev);
     }
 
     // ex. adoptChangesetAttribs

@@ -1416,8 +1416,12 @@ export const inverse = (cs: string, lines: string|RegExpMatchArray|string[] | nu
             const oldValue = oldAttribs.get(key) || '';
             if (oldValue !== value) backAttribs.set(key, oldValue);
           }
-          // TODO: backAttribs does not restore removed attributes (it is missing attributes that
-          // are in oldAttribs but not in attribs). I don't know if that is intentional.
+          // Also restore attributes that the changeset removed (present before but not set by the
+          // changeset), otherwise undoing an attribute-only edit (such as clearing authorship
+          // colors while other attributes are present) would not fully reconstruct the document.
+          for (const [key, oldValue] of oldAttribs) {
+            if (!attribs.has(key)) backAttribs.set(key, oldValue);
+          }
           return backAttribs.toString();
         });
         consumeAttribRuns(csOp.chars, (len: number, attribs: string, endsLine: number) => {

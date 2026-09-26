@@ -3,7 +3,7 @@ import {
   clearAuthorship,
   clearPadContent,
   getPadBody,
-  goToNewPad, pressUndoButton,
+  goToNewPad,
   selectAllText,
   undoChanges,
   writeToPad
@@ -35,8 +35,8 @@ test('clear authorship color', async ({page}) => {
 })
 
 
-test("makes text clear authorship colors and checks it can't be undone", async function ({page}) {
-  const innnerPad = await getPadBody(page);
+test("clearing authorship colors can be undone and redone", async function ({page}) {
+  const innerPad = await getPadBody(page);
   const padText = "Hello"
 
   // type some text
@@ -44,23 +44,27 @@ test("makes text clear authorship colors and checks it can't be undone", async f
   await writeToPad(page, padText);
 
   // get the first text element out of the inner iframe
-  const firstDivClass = innnerPad.locator('div').nth(0)
-  const retrievedClasses = await innnerPad.locator('div span').nth(0).getAttribute('class')
-  expect(retrievedClasses).toContain('author');
+  const firstDiv = innerPad.locator('div').nth(0)
+  const firstSpan = innerPad.locator('div span').nth(0)
+  expect(await firstSpan.getAttribute('class')).toContain('author');
 
-
-  await firstDivClass.focus()
+  await firstDiv.focus()
+  // Accept the confirm dialog triggered when there is no selection
+  page.on('dialog', dialog => dialog.accept());
   await clearAuthorship(page);
-  expect(await firstDivClass.getAttribute('class')).not.toContain('author');
+  expect(await firstDiv.getAttribute('class')).not.toContain('author');
 
+  // One Ctrl+Z must restore the original author colors without changing the text.
   await undoChanges(page);
-  const changedFirstDiv = innnerPad.locator('div').nth(0)
-  expect(await changedFirstDiv.getAttribute('class')).not.toContain('author');
+  expect(await firstSpan.getAttribute('class')).toContain('author');
+  expect(await firstDiv.textContent()).toBe(padText);
 
-
-  await pressUndoButton(page);
-  const secondChangedFirstDiv = innnerPad.locator('div').nth(0)
-  expect(await secondChangedFirstDiv.getAttribute('class')).not.toContain('author');
+  // Ctrl+Y must redo the clear, removing the colors again without changing the text.
+  await page.keyboard.down('Control');
+  await page.keyboard.press('y');
+  await page.keyboard.up('Control');
+  expect(await firstSpan.getAttribute('class')).not.toContain('author');
+  expect(await firstDiv.textContent()).toBe(padText);
 });
 
 
