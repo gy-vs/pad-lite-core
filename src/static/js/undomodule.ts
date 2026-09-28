@@ -212,9 +212,14 @@ const undoModule = (() => {
         }
       }
       if (!merged) {
-        if (event && (event.eventType !== 'clearauthorship')) {
-          stack.pushEvent(event);
-        }
+        // A clearauthorship event is a normal, undoable edit: pushing it on the
+        // stack means a single undo restores the previous authorship colors
+        // instead of skipping past it and undoing older edits (possibly from
+        // other authors). The server additionally verifies that an undo can
+        // only restore authorship that was previously present on those exact
+        // characters, so this can't be abused to attribute text to someone
+        // else (see handleUserChanges() in PadMessageHandler).
+        stack.pushEvent(event);
       }
       undoPtr = 0;
     }

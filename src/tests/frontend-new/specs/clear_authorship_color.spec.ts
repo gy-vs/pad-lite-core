@@ -3,7 +3,7 @@ import {
   clearAuthorship,
   clearPadContent,
   getPadBody,
-  goToNewPad, pressUndoButton,
+  goToNewPad,
   selectAllText,
   undoChanges,
   writeToPad
@@ -35,7 +35,7 @@ test('clear authorship color', async ({page}) => {
 })
 
 
-test("makes text clear authorship colors and checks it can't be undone", async function ({page}) {
+test("clear authorship colors can be undone and redone", async function ({page}) {
   const innnerPad = await getPadBody(page);
   const padText = "Hello"
 
@@ -53,14 +53,19 @@ test("makes text clear authorship colors and checks it can't be undone", async f
   await clearAuthorship(page);
   expect(await firstDivClass.getAttribute('class')).not.toContain('author');
 
+  // Ctrl+Z must undo exactly the "clear authorship colors" action, bringing
+  // the original author colors back without changing the text.
   await undoChanges(page);
-  const changedFirstDiv = innnerPad.locator('div').nth(0)
-  expect(await changedFirstDiv.getAttribute('class')).not.toContain('author');
+  const restoredFirstDiv = innnerPad.locator('div').nth(0)
+  expect(await restoredFirstDiv.locator('span').nth(0).getAttribute('class'))
+      .toContain('author');
+  expect(await restoredFirstDiv.textContent()).toBe(padText);
 
-
-  await pressUndoButton(page);
-  const secondChangedFirstDiv = innnerPad.locator('div').nth(0)
-  expect(await secondChangedFirstDiv.getAttribute('class')).not.toContain('author');
+  // Ctrl+Y must redo the color clearing.
+  await page.keyboard.press('Control+y');
+  const reclearedFirstDiv = innnerPad.locator('div').nth(0)
+  expect(await reclearedFirstDiv.getAttribute('class')).not.toContain('author');
+  expect(await reclearedFirstDiv.textContent()).toBe(padText);
 });
 
 

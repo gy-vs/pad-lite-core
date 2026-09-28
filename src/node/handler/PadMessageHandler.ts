@@ -65,6 +65,129 @@ const addContextToError = (err:any, pfx:string) => {
   return err;
 };
 
+// Small cache for reconstructOriginalAuthors(): the highest replayed
+// revision per pad and the per-character original-author array at that
+// revision. Authorship restoration is rare (undo of a color clearing), but
+// without this cache it would issue one database read per stored revision on
+// big pads; in the common case the undo is submitted right after the clear,
+// so the replay only has to catch up one or two revisions.
+const originalAuthorsCache = new Map<string, {rev: number, authors: string[]}>();
+
+/**
+ * Reconstructs the original (inserting) author of every character of the pad
+ * as it existed at revision `targetRev`.
+ *
+ * Authorship in Etherpad is immutable for the lifetime of a character:
+ *   * a character is born with the submitting user's author ID ('+' ops are
+ *     forced to carry the submitter's own ID, both on the client and by the
+ *     server),
+ *   * ordinary edits never change the author of surviving characters,
+ *   * only the "clear authorship colors" action blanks it out (and its undo
+ *     restores it).
+ *
+ * Replaying the stored revisions therefore reveals the genuine author of any
+ * surviving character even when the current atext shows an empty author
+ * (colors were cleared). The returned array is aligned with the document text
+ * at `targetRev`.
+ */
+const reconstructOriginalAuthors = async (pad: PadType, targetRev: number): Promise<string[]> => {
+  const cacheKey = pad.id;
+  const cached = originalAuthorsCache.get(cacheKey);
+  let startRev = 1;
+  let originalAuthors: string[];
+
+  if (cached != null && cached.rev <= targetRev) {
+    // Fast path: continue from the already replayed revision.
+    startRev = cached.rev + 1;
+    originalAuthors = cached.authors;
+  } else {
+    // No usable cache (first call, or targetRev is older than the cache).
+    originalAuthorsCache.delete(cacheKey);
+    const revision0 = await pad.getRevision('0');
+    const atext0 = await pad.getInternalRevisionAText(0);
+    originalAuthors = new Array<string>(atext0.text.length).fill(revision0.meta.author || '');
+  }
+
+  for (let r = startRev; r <= targetRev; r++) {
+    const {changeset, meta: {author = ''}} = await pad.getRevision(String(r));
+    let cursor = 0;
+    for (const op of deserializeOps(unpack(changeset).ops)) {
+      if (op.opcode === '=') {
+        cursor += op.chars;
+      } else if (op.opcode === '-') {
+        originalAuthors.splice(cursor, op.chars);
+      } else if (op.opcode === '+') {
+        // Inserted characters are born with the submitting revision's author.
+        originalAuthors.splice(cursor, 0, ...new Array<string>(op.chars).fill(author || ''));
+        cursor += op.chars;
+      }
+    }
+  }
+
+  if (cached == null || targetRev >= cached.rev) {
+    originalAuthorsCache.set(cacheKey, {rev: targetRev, authors: originalAuthors});
+    // Bound the cache: evict the oldest entry (insertion order) once it grows
+    // past a pad count that no real instance approaches concurrently.
+    if (originalAuthorsCache.size > 1000) {
+      const oldestKey = originalAuthorsCache.keys().next().value;
+      if (oldestKey != null) originalAuthorsCache.delete(oldestKey);
+    }
+  }
+  return originalAuthors.slice();
+};
+
+/**
+ * Verifies the 'author' attributes set on kept characters ('=' ops) of a
+ * client changeset relative to the pad at `baseRev`.
+ *
+ * Normally every 'author' attribute in a submitted changeset must be the
+ * submitting user's own author ID. There is one legitimate exception: undoing
+ * (or redoing) a "clear authorship colors" edit. The client-side undo stack
+ * produces an inverse changeset whose '=' ops restore the author attributes
+ * that were on those exact characters before the colors were cleared.
+ *
+ * This function proves the exception cannot be abused to claim authorship of
+ * someone else's text: every non-empty author ID placed on a character must
+ * match that character's original (inserting) author reconstructed from the
+ * pad history. An attacker can never satisfy this for text they wrote
+ * themselves. If other clients deleted or replaced the covered characters
+ * after the client's baseRev, follow() drops the restored '=' attributes from
+ * those characters when the changeset is rebased, so a stale base revision
+ * cannot be used to tag someone else's ID onto rewritten text.
+ */
+const verifyAuthorshipRestoration = async (
+    pad: PadType, baseRev: number, changeset: string, apool: AttributePool) => {
+  const baseText = (await pad.getInternalRevisionAText(baseRev)).text;
+  if (oldLen(changeset) !== baseText.length) {
+    throw new Error(
+        `Can't verify changeset ${changeset} with oldLen ${oldLen(changeset)} against document ` +
+        `of length ${baseText.length}`);
+  }
+
+  const originalAuthors = await reconstructOriginalAuthors(pad, baseRev);
+
+  let cursor = 0;
+  for (const op of deserializeOps(unpack(changeset).ops)) {
+    if (op.opcode === '=') {
+      const opAuthorId = AttributeMap.fromString(op.attribs, apool).get('author');
+      if (opAuthorId) {
+        for (let i = 0; i < op.chars; i++) {
+          if (originalAuthors[cursor + i] !== opAuthorId) {
+            throw new Error(
+                `tried to restore authorship ${opAuthorId} at char ${cursor + i}, but that ` +
+                `character was written by ${originalAuthors[cursor + i] || '<anonymous>'}`);
+          }
+        }
+      }
+      cursor += op.chars;
+    } else if (op.opcode === '-') {
+      cursor += op.chars;
+    }
+    // '+' ops add new text; their author was already checked to be the
+    // submitting user's own ID.
+  }
+};
+
 exports.socketio = () => {
   // The rate limiter is created in this hook so that restarting the server resets the limiter. The
   // settings.commitRateLimiting object is passed directly to the rate limiter so that the limits
@@ -651,7 +774,22 @@ const handleUserChanges = async (socket:any, message: {
     // Verify that the changeset has valid syntax and is in canonical form
     checkRep(changeset);
 
-    // Validate all added 'author' attribs to be the same value as the current user
+    if (typeof baseRev !== 'number' || !Number.isInteger(baseRev) ||
+        baseRev < 0 || baseRev > pad.getHeadRevisionNumber()) {
+      throw new Error(`invalid baseRev ${baseRev} (head is ${pad.getHeadRevisionNumber()})`);
+    }
+
+    // Validate 'author' attribs.
+    //  * '+' (inserted text) and '-' (deleted text) ops may only carry the
+    //    submitting user's own author ID: inserted text is the user's own
+    //    contribution and nobody can write under someone else's identity.
+    //  * '=' (kept text) ops may also set a foreign author ID when the
+    //    changeset restores authorship that the affected characters originally
+    //    had. This is what undo/redo of "clear authorship colors" produces;
+    //    verifyAuthorshipRestoration() below proves each restored value matches
+    //    the character's original inserting author in the pad history, so it
+    //    cannot be used to claim authorship of other people's text.
+    let restoresAuthorship = false;
     for (const op of deserializeOps(unpack(changeset).ops)) {
       // + can add text with attribs
       // = can change or add attribs
@@ -663,15 +801,30 @@ const handleUserChanges = async (socket:any, message: {
       // an attribute number isn't in the pool).
       const opAuthorId = AttributeMap.fromString(op.attribs, wireApool).get('author');
       if (opAuthorId && opAuthorId !== thisSession.author) {
-        throw new Error(`Author ${thisSession.author} tried to submit changes as author ` +
-                        `${opAuthorId} in changeset ${changeset}`);
+        if (op.opcode === '=') {
+          restoresAuthorship = true;
+        } else {
+          throw new Error(`Author ${thisSession.author} tried to submit changes as author ` +
+                          `${opAuthorId} in changeset ${changeset}`);
+        }
       }
     }
 
     // ex. adoptChangesetAttribs
 
     // Afaik, it copies the new attributes from the changeset, to the global Attribute Pool
-    let rebasedChangeset = moveOpsToNewPool(changeset, wireApool, pad.pool);
+    const padPoolChangeset = moveOpsToNewPool(changeset, wireApool, pad.pool);
+
+    // Before rebasing, prove that any restored authorship matches the original
+    // inserting author recorded in history at the client's base revision.
+    // Rebasing afterwards is what keeps this safe under concurrent edits:
+    // follow() drops restored '=' attribution from characters other clients
+    // delete or replace, so it can never land on rewritten text.
+    if (restoresAuthorship) {
+      await verifyAuthorshipRestoration(pad, baseRev, padPoolChangeset, pad.pool);
+    }
+
+    let rebasedChangeset = padPoolChangeset;
 
     // ex. applyUserChanges
     let r = baseRev;
